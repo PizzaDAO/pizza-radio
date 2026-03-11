@@ -4,6 +4,7 @@ const path = require('path');
 const { Client, GatewayIntentBits, Collection } = require('discord.js');
 const { joinVoiceChannel } = require('@discordjs/voice');
 const { SlashCommandBuilder } = require('discord.js');
+const { createApiServer } = require('./api');
 
 // Create a new Discord client with necessary intents
 const client = new Client({
@@ -71,6 +72,9 @@ client.once('ready', () => {
 
     // Join the voice channel upon connecting
     joinVoiceChannelHandler();
+
+    // Start HTTP API server
+    createApiServer(client);
 });
 
 // Handle reconnections if disconnected
