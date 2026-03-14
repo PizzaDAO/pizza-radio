@@ -5,6 +5,7 @@ const { Client, GatewayIntentBits, Collection } = require('discord.js');
 const { joinVoiceChannel } = require('@discordjs/voice');
 const { SlashCommandBuilder } = require('discord.js');
 const { createApiServer } = require('./api');
+const { syncSongsFromR2 } = require('./services/r2-sync');
 
 // Create a new Discord client with necessary intents
 const client = new Client({
@@ -114,7 +115,14 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// Log in to Discord
-client.login(TOKEN).catch((error) => {
-    console.error('Failed to log in:', error);
-});
+// Sync songs from R2, then log in to Discord
+(async () => {
+    try {
+        await syncSongsFromR2();
+    } catch (error) {
+        console.error('R2 sync failed (continuing anyway):', error);
+    }
+    client.login(TOKEN).catch((error) => {
+        console.error('Failed to log in:', error);
+    });
+})();

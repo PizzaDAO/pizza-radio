@@ -7,7 +7,7 @@ function createApiServer(client) {
     app.use(express.json());
 
     const API_KEY = process.env.PIZZA_RADIO_API_KEY;
-    const PORT = process.env.API_PORT || 3000;
+    const PORT = process.env.PORT || process.env.API_PORT || 3000;
     const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
     const GUILD_ID = process.env.DISCORD_GUILD_ID;
 

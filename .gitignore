@@ -5,3 +5,5 @@ logs/
 *.log
 .DS_Store
 Thumbs.db
+secrets.md
+upload-to-r2.js
