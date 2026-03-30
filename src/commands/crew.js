@@ -12,6 +12,8 @@ const CREWS = [
 ];
 
 module.exports = {
+    CREWS,
+    crewFolder,
     data: new SlashCommandBuilder()
         .setName('crew')
         .setDescription('Plays a crew theme song')
