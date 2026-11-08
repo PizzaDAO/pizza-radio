@@ -173,6 +173,97 @@ function createApiServer(client) {
         }
     });
 
+    // Play the house band folder in random order, like /band (keeps reshuffling until /stop)
+    app.post('/play-band', async (req, res) => {
+        try {
+            const guild = client.guilds.cache.get(GUILD_ID);
+            if (!guild) {
+                return res.status(500).json({ error: 'Guild not found' });
+            }
+
+            const channelId = req.body.channelId || VOICE_CHANNEL_ID;
+            const voiceChannel = guild.channels.cache.get(channelId);
+            if (!voiceChannel) {
+                return res.status(400).json({ error: 'Voice channel not found' });
+            }
+
+            const bandFolder = path.join(__dirname, '../songs/band');
+            if (!fs.existsSync(bandFolder)) {
+                return res.status(404).json({ error: 'No band song folder found' });
+            }
+
+            const supportedExtensions = ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.wma'];
+            const allFiles = fs.readdirSync(bandFolder).filter(file =>
+                supportedExtensions.includes(path.extname(file).toLowerCase())
+            );
+            if (allFiles.length === 0) {
+                return res.status(404).json({ error: 'No audio files found for the band' });
+            }
+
+            const shuffle = (array) => {
+                for (let i = array.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [array[i], array[j]] = [array[j], array[i]];
+                }
+                return array;
+            };
+
+            // Stop any existing playback
+            if (state.player) {
+                state.player.removeAllListeners();
+                state.player.stop();
+                state.player = null;
+            }
+            state.queue = shuffle([...allFiles]);
+
+            const connection = joinVoiceChannel({
+                channelId: channelId,
+                guildId: guild.id,
+                adapterCreator: guild.voiceAdapterCreator,
+            });
+            state.connection = connection;
+
+            if (connection.state.status !== VoiceConnectionStatus.Ready) {
+                await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+            }
+
+            const player = createAudioPlayer();
+            state.player = player;
+
+            const playNextSong = () => {
+                if (state.queue.length === 0) {
+                    state.queue = shuffle([...allFiles]);
+                }
+                const nextSong = state.queue.shift();
+                console.log(`Playing: ${nextSong}`);
+                player.play(createAudioResource(path.join(bandFolder, nextSong)));
+            };
+
+            player.on(AudioPlayerStatus.Idle, playNextSong);
+            player.on('error', (error) => {
+                console.error('Error during band playback:', error);
+                playNextSong();
+            });
+
+            connection.subscribe(player);
+            playNextSong();
+
+            res.json({ success: true, message: 'Playing the PizzaDAO House Band in random order' });
+        } catch (err) {
+            console.error('API /play-band error:', err);
+            if (state.player) {
+                state.player.removeAllListeners();
+                state.player.stop();
+                state.player = null;
+            }
+            if (state.connection) {
+                state.connection.destroy();
+                state.connection = null;
+            }
+            res.status(500).json({ error: err.message });
+        }
+    });
+
     // Stop playback
     app.post('/stop', async (req, res) => {
         try {
