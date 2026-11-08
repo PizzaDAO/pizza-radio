@@ -173,7 +173,8 @@ function createApiServer(client) {
         }
     });
 
-    // Play the house band folder in random order, like /band (keeps reshuffling until /stop)
+    // Play the house band folder in random order, like /band. Keeps reshuffling until /stop,
+    // or with { maxSongs: n } leaves the channel after n songs.
     app.post('/play-band', async (req, res) => {
         try {
             const guild = client.guilds.cache.get(GUILD_ID);
@@ -230,7 +231,22 @@ function createApiServer(client) {
             const player = createAudioPlayer();
             state.player = player;
 
+            const maxSongs = Number.isInteger(req.body.maxSongs) && req.body.maxSongs > 0 ? req.body.maxSongs : null;
+            let played = 0;
+
             const playNextSong = () => {
+                if (maxSongs !== null && played >= maxSongs) {
+                    console.log(`Band played ${played} song(s), disconnecting.`);
+                    player.removeAllListeners();
+                    player.stop();
+                    if (state.player === player) state.player = null;
+                    if (state.connection === connection) {
+                        connection.destroy();
+                        state.connection = null;
+                    }
+                    return;
+                }
+                played++;
                 if (state.queue.length === 0) {
                     state.queue = shuffle([...allFiles]);
                 }
@@ -248,7 +264,7 @@ function createApiServer(client) {
             connection.subscribe(player);
             playNextSong();
 
-            res.json({ success: true, message: 'Playing the PizzaDAO House Band in random order' });
+            res.json({ success: true, maxSongs, message: 'Playing the PizzaDAO House Band in random order' });
         } catch (err) {
             console.error('API /play-band error:', err);
             if (state.player) {
