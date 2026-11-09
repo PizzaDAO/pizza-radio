@@ -64,6 +64,12 @@ function createApiServer(client) {
             if (!crew) {
                 return res.status(400).json({ error: 'Missing "crew" field in request body', validCrews: CREWS });
             }
+            // The end-of-call song comes from the call recorder, which always names the call's voice channel.
+            // Requests without one (the old Apps Script song timer) are ignored so the song never plays twice.
+            if (!req.body.channelId && process.env.PLAY_CREW_REQUIRE_CHANNEL !== 'off') {
+                console.log(`Ignored /play-crew for "${crew}" without a channelId`);
+                return res.status(409).json({ error: 'channelId is required' });
+            }
 
             // Case-insensitive crew lookup
             const matchedCrew = CREWS.find(c => c.toLowerCase() === crew.toLowerCase());
