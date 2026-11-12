@@ -144,8 +144,10 @@ function createPlayback(deps) {
     }
 
     // Stop whatever is playing. With leave, also disconnect. With tag, only acts on url clips of that tag.
-    function stop({ leave = false, tag = null } = {}) {
+    function stop({ leave = false, tag = null, channelId = null } = {}) {
         if (tag && !(state.kind === 'url' && state.tag === tag)) return { stopped: false };
+        // With a channel, only act on what plays (or is queued) in that channel.
+        if (channelId && currentChannel(state) !== channelId && !(state.pending && state.pending.channelId === channelId)) return { stopped: false };
         const had = isBusy(state) || !!state.pending;
         stopPlayer();
         state.queue = [];

@@ -350,7 +350,8 @@ function createApiServer(client) {
             const body = req.body || {};
             const leave = body.leave === true || req.query.leave === '1';
             const tag = typeof body.tag === 'string' && body.tag ? body.tag : null;
-            const result = playback.stop({ leave, tag });
+            const channelId = typeof body.channelId === 'string' && body.channelId ? body.channelId : null;
+            const result = playback.stop({ leave, tag, channelId });
             res.json({ success: true, stopped: result.stopped, left: leave && !state.connection, message: 'Playback stopped' });
         } catch (err) {
             console.error('API /stop error:', err);

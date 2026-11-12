@@ -221,3 +221,13 @@ test('a failed download leaves existing playback alone and cleans up', async () 
     assert.deepStrictEqual(h.log, ['cleanup c0']);
     assert.strictEqual(h.state.player, null);
 });
+
+test('stop with a channelId only acts on that channel', async () => {
+    const h = harness();
+    await h.pb.start(req(2));
+    const conn = h.state.connection;
+    assert.deepStrictEqual(h.pb.stop({ leave: true, channelId: 'B' }), { stopped: false });
+    assert.strictEqual(conn.destroyed, false);
+    assert.strictEqual(h.pb.stop({ leave: true, channelId: 'A' }).stopped, true);
+    assert.strictEqual(conn.destroyed, true);
+});
