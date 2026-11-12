@@ -3,6 +3,7 @@ const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerSta
 const fs = require('fs');
 const path = require('path');
 const state = require('../state');
+const { takeOver } = require('../services/playback');
 
 const crewFolder = path.join(__dirname, '../../songs/Crew');
 
@@ -51,6 +52,7 @@ module.exports = {
                 return;
             }
 
+            takeOver(state, { kind: null, channelId: voiceChannel.id });
             state.connection = joinVoiceChannel({
                 channelId: voiceChannel.id,
                 guildId: voiceChannel.guild.id,

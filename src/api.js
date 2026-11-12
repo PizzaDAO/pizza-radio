@@ -1,10 +1,30 @@
 const express = require('express');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, StreamType } = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
 const state = require('./state');
 const { startMixtape } = require('./services/mixtape-service');
 const { CREWS, crewFolder } = require('./commands/crew');
+const os = require('os');
+const { createPlayback, validatePlayUrl, parseAllowedHosts } = require('./services/playback');
+
+// Download a clip to a temp file (size-capped) so a slow stream can't stall playback.
+async function downloadClip(url, maxBytes) {
+    const res = await fetch(url, { signal: AbortSignal.timeout(20_000), redirect: 'error' });
+    if (!res.ok) throw new Error(`clip download failed: ${res.status}`);
+    const len = Number(res.headers.get('content-length') || 0);
+    if (len > maxBytes) throw new Error('clip too large');
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of res.body) {
+        total += chunk.length;
+        if (total > maxBytes) throw new Error('clip too large');
+        chunks.push(Buffer.from(chunk));
+    }
+    const file = path.join(os.tmpdir(), `clip-${Date.now()}-${Math.random().toString(36).slice(2)}.ogg`);
+    fs.writeFileSync(file, Buffer.concat(chunks));
+    return { path: file, cleanup: () => fs.rmSync(file, { force: true }) };
+}
 
 function createApiServer(client) {
     const app = express();
@@ -14,6 +34,28 @@ function createApiServer(client) {
     const PORT = process.env.PORT || process.env.API_PORT || 3000;
     const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
     const GUILD_ID = process.env.DISCORD_GUILD_ID;
+    const allowedHosts = parseAllowedHosts(process.env.PLAY_URL_ALLOWED_HOSTS);
+
+    const playback = createPlayback({
+        state,
+        join: async (channelId) => {
+            const guild = client.guilds.cache.get(GUILD_ID);
+            if (!guild) throw new Error('Guild not found');
+            const connection = joinVoiceChannel({ channelId, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator });
+            if (connection.state.status !== VoiceConnectionStatus.Ready) {
+                await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+            }
+            return connection;
+        },
+        createPlayer: () => createAudioPlayer(),
+        createResource: (file) => createAudioResource(file, { inputType: StreamType.OggOpus }),
+        download: downloadClip,
+        setTimer: setTimeout,
+        clearTimer: clearTimeout,
+        now: Date.now,
+        idleEvent: AudioPlayerStatus.Idle,
+        log: (m) => console.log(`[play-url] ${m}`),
+    });
 
     // Health check (no auth required)
     app.get('/health', (req, res) => {
@@ -103,12 +145,13 @@ function createApiServer(client) {
                 return res.status(404).json({ error: `No audio files found for crew "${matchedCrew}"` });
             }
 
-            // Stop any existing playback
+            // Stop any existing playback (and any pause timer / queued clips of the spoken updates)
             if (state.player) {
                 state.player.removeAllListeners();
                 state.player.stop();
                 state.player = null;
             }
+            playback.takeOver({ kind: 'crew', channelId });
             state.queue = [];
 
             // Join voice channel
@@ -127,6 +170,9 @@ function createApiServer(client) {
             // Create player and play crew theme
             const player = createAudioPlayer();
             state.player = player;
+            state.kind = 'crew';
+            state.channelId = channelId;
+            state.tag = null;
 
             const songFile = allFiles[0];
             const songName = path.parse(songFile).name;
@@ -137,6 +183,9 @@ function createApiServer(client) {
                 console.log(`Crew theme for "${matchedCrew}" finished, disconnecting.`);
                 player.stop();
                 state.player = null;
+                state.kind = null;
+                state.channelId = null;
+                if (playback.handoff(connection)) return;
                 if (state.connection) {
                     state.connection.destroy();
                     state.connection = null;
@@ -215,12 +264,13 @@ function createApiServer(client) {
                 return array;
             };
 
-            // Stop any existing playback
+            // Stop any existing playback (and any pause timer / queued clips of the spoken updates)
             if (state.player) {
                 state.player.removeAllListeners();
                 state.player.stop();
                 state.player = null;
             }
+            playback.takeOver({ kind: 'band', channelId });
             state.queue = shuffle([...allFiles]);
 
             const connection = joinVoiceChannel({
@@ -236,6 +286,9 @@ function createApiServer(client) {
 
             const player = createAudioPlayer();
             state.player = player;
+            state.kind = 'band';
+            state.channelId = channelId;
+            state.tag = null;
 
             const maxSongs = Number.isInteger(req.body.maxSongs) && req.body.maxSongs > 0 ? req.body.maxSongs : null;
             let played = 0;
@@ -245,7 +298,13 @@ function createApiServer(client) {
                     console.log(`Band played ${played} song(s), disconnecting.`);
                     player.removeAllListeners();
                     player.stop();
-                    if (state.player === player) state.player = null;
+                    if (state.player === player) {
+                        state.player = null;
+                        state.kind = null;
+                        state.channelId = null;
+                        // Queued updates in this channel take over the connection instead of leaving.
+                        if (playback.handoff(connection)) return;
+                    }
                     if (state.connection === connection) {
                         connection.destroy();
                         state.connection = null;
@@ -286,21 +345,63 @@ function createApiServer(client) {
         }
     });
 
-    // Stop playback
+    // Stop playback. Default: stop the player and stay (as before). With { leave: true } (body or ?leave=1)
+    // also disconnect. With { tag } only stop url clips of that tag.
     app.post('/stop', async (req, res) => {
         try {
-            const state = require('./state');
-            if (state.player) {
-                state.player.removeAllListeners();
-                state.player.stop();
-                state.player = null;
-            }
-            state.queue = [];
-            res.json({ success: true, message: 'Playback stopped' });
+            const body = req.body || {};
+            const leave = body.leave === true || req.query.leave === '1';
+            const tag = typeof body.tag === 'string' && body.tag ? body.tag : null;
+            const channelId = typeof body.channelId === 'string' && body.channelId ? body.channelId : null;
+            const result = playback.stop({ leave, tag, channelId });
+            res.json({ success: true, stopped: result.stopped, left: leave && !state.connection, message: 'Playback stopped' });
         } catch (err) {
             console.error('API /stop error:', err);
             res.status(500).json({ error: err.message });
         }
+    });
+
+    // Play pre-rendered audio clips (Ogg/Opus) from allowed hosts, e.g. spoken call updates.
+    app.post('/play-url', async (req, res) => {
+        try {
+            const v = validatePlayUrl(req.body, allowedHosts);
+            if (!v.ok) return res.status(v.status).json({ error: v.error });
+            const guild = client.guilds.cache.get(GUILD_ID);
+            if (!guild) return res.status(500).json({ error: 'Guild not found' });
+            if (!guild.channels.cache.get(v.value.channelId)) {
+                return res.status(400).json({ error: 'Voice channel not found' });
+            }
+            const result = await playback.start(v.value);
+            if (result.status === 'busy-elsewhere') {
+                return res.status(409).json({ error: 'busy-elsewhere' });
+            }
+            res.json({ success: true, ...result, clips: v.value.clips.length });
+        } catch (err) {
+            console.error('API /play-url error:', err);
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    const controlOpts = (req) => ({
+        tag: typeof (req.body || {}).tag === 'string' && req.body.tag ? req.body.tag : null,
+        channelId: typeof (req.body || {}).channelId === 'string' && req.body.channelId ? req.body.channelId : null,
+        pauseMaxMs: Number((req.body || {}).pauseMaxMs) > 0 ? Number(req.body.pauseMaxMs) : null,
+    });
+    for (const action of ['pause', 'resume', 'skip']) {
+        app.post(`/${action}`, (req, res) => {
+            try {
+                const result = playback[action](controlOpts(req));
+                if (!result.ok) return res.status(409).json({ error: result.reason });
+                res.json({ success: true, ...result });
+            } catch (err) {
+                console.error(`API /${action} error:`, err);
+                res.status(500).json({ error: err.message });
+            }
+        });
+    }
+
+    app.get('/status', (req, res) => {
+        res.json(playback.status());
     });
 
     app.listen(PORT, '0.0.0.0', () => {
