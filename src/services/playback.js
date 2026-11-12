@@ -68,8 +68,44 @@ function currentChannel(state) {
     return state.channelId || (state.connection && state.connection.joinConfig && state.connection.joinConfig.channelId) || null;
 }
 
+const DEAD_STATUSES = ['destroyed', 'disconnected'];
+
+// A destroyed or disconnected connection is not playing anything.
+function liveConnection(state) {
+    const c = state.connection;
+    if (!c) return false;
+    const status = c.state && c.state.status;
+    return !DEAD_STATUSES.includes(status);
+}
+
 function isBusy(state) {
-    return !!(state.player || state.connection);
+    return !!(state.player || liveConnection(state) || state.starting);
+}
+
+// Reset the url-playback bookkeeping when another command takes the player over (band, crew song,
+// mixtape, slash commands): no stale pause timer may stop the new audio, queued clips are dropped and
+// temp files are removed. The caller replaces the player and connection itself.
+function takeOver(state, { kind = null, channelId = null, clearTimer = clearTimeout } = {}) {
+    if (state.pauseTimer) clearTimer(state.pauseTimer);
+    if (state.pendingTimer) clearTimer(state.pendingTimer);
+    for (const f of state.files || []) {
+        try {
+            f.cleanup();
+        } catch {
+            /* ignore */
+        }
+    }
+    state.pauseTimer = null;
+    state.pendingTimer = null;
+    state.files = [];
+    state.pending = null;
+    state.paused = false;
+    state.starting = false;
+    state.kind = kind;
+    state.channelId = channelId;
+    state.tag = null;
+    state.clipIndex = 0;
+    state.clipCount = 0;
 }
 
 // What to do with a request for `channelId` given what is playing right now.
@@ -79,38 +115,40 @@ function decideBusy(state, channelId, ifBusy) {
     const ch = currentChannel(state);
     // Another channel, or an older slash command whose channel we can't tell: never hijack.
     if (!ch || ch !== channelId) return 'busy-elsewhere';
+    // Clips being fetched right now: not ours to replace.
+    if (state.starting) return 'busy-elsewhere';
     // New clips replace earlier url clips in the same channel.
     if (state.kind === 'url') return 'start';
+    // Only the house band and crew songs are worth waiting behind; anything else is never hijacked.
+    if (state.kind !== 'band' && state.kind !== 'crew') return 'busy-elsewhere';
     return ifBusy === 'skip' ? 'skipped' : 'queue';
 }
 
 function createPlayback(deps) {
     const { state, join, createPlayer, createResource, download, setTimer, clearTimer, now, log } = deps;
     const IDLE = deps.idleEvent || 'idle';
-    let files = [];
-    let pauseTimer = null;
-    let pendingTimer = null;
+    state.files = state.files || [];
 
     const cleanupFiles = () => {
-        for (const f of files) {
+        for (const f of state.files) {
             try {
                 f.cleanup();
             } catch {
                 /* ignore */
             }
         }
-        files = [];
+        state.files = [];
     };
 
     const clearPending = () => {
         state.pending = null;
-        if (pendingTimer) clearTimer(pendingTimer);
-        pendingTimer = null;
+        if (state.pendingTimer) clearTimer(state.pendingTimer);
+        state.pendingTimer = null;
     };
 
     const clearPause = () => {
-        if (pauseTimer) clearTimer(pauseTimer);
-        pauseTimer = null;
+        if (state.pauseTimer) clearTimer(state.pauseTimer);
+        state.pauseTimer = null;
         state.paused = false;
     };
 
@@ -164,7 +202,7 @@ function createPlayback(deps) {
         destroyConnection();
     }
 
-    async function run(req, existingConnection) {
+    async function fetchAll(req) {
         const downloaded = [];
         try {
             for (const c of req.clips) downloaded.push(await download(c.url, MAX_CLIP_BYTES));
@@ -172,13 +210,20 @@ function createPlayback(deps) {
             for (const d of downloaded) d.cleanup();
             throw err;
         }
-        // Replace any earlier clips now that the new audio is in hand.
+        return downloaded;
+    }
+
+    // Play already downloaded clips. The player is reserved in state before anything is awaited, so a band
+    // or crew song that starts meanwhile takes over cleanly (and we notice and step aside).
+    async function play(req, downloaded, existingConnection) {
+        // A stale pause from earlier audio must never stop this one.
+        clearPause();
         stopPlayer();
         cleanupFiles();
-        files = downloaded;
+        state.files = downloaded;
         state.queue = [];
-        const connection = existingConnection || (await join(req.channelId));
-        state.connection = connection;
+        const player = createPlayer();
+        state.player = player;
         state.kind = 'url';
         state.channelId = req.channelId;
         state.tag = req.tag;
@@ -186,8 +231,19 @@ function createPlayback(deps) {
         state.clipCount = downloaded.length;
         state.paused = false;
         state.pauseMaxMs = req.pauseMaxMs;
-        const player = createPlayer();
-        state.player = player;
+        let connection;
+        try {
+            connection = existingConnection || (await join(req.channelId));
+        } catch (err) {
+            if (state.player === player) stop({ leave: true });
+            throw err;
+        }
+        if (state.player !== player) {
+            // Something else took over while we were joining.
+            for (const d of downloaded) d.cleanup();
+            return false;
+        }
+        state.connection = connection;
         const playIndex = (i) => {
             if (state.player !== player) return;
             if (i >= downloaded.length) return finish();
@@ -204,25 +260,44 @@ function createPlayback(deps) {
         });
         connection.subscribe(player);
         playIndex(0);
+        return true;
+    }
+
+    function queueRequest(req) {
+        // Behind the band / crew song in the same channel. The newest request wins.
+        clearPending();
+        state.pending = { ...req, expiresAt: now() + req.maxWaitMs };
+        state.pendingTimer = setTimer(() => {
+            if (state.pending) log('queued clips expired');
+            state.pending = null;
+            state.pendingTimer = null;
+        }, req.maxWaitMs);
+        return { status: 'queued' };
     }
 
     async function start(req) {
         const decision = decideBusy(state, req.channelId, req.ifBusy);
         if (decision === 'busy-elsewhere') return { status: 'busy-elsewhere' };
         if (decision === 'skipped') return { status: 'skipped', reason: 'busy' };
-        if (decision === 'queue') {
-            // Behind the band / crew song in the same channel. The newest request wins.
-            clearPending();
-            state.pending = { ...req, expiresAt: now() + req.maxWaitMs };
-            pendingTimer = setTimer(() => {
-                if (state.pending) log('queued clips expired');
-                state.pending = null;
-                pendingTimer = null;
-            }, req.maxWaitMs);
-            return { status: 'queued' };
+        if (decision === 'queue') return queueRequest(req);
+        // Mark the start so a second request does not run in parallel, then fetch the audio.
+        state.starting = true;
+        let downloaded;
+        try {
+            downloaded = await fetchAll(req);
+        } finally {
+            state.starting = false;
         }
-        await run(req, null);
-        return { status: 'playing' };
+        // Something (a band, a crew song) may have started while we downloaded: decide again.
+        const again = decideBusy(state, req.channelId, req.ifBusy);
+        if (again !== 'start') {
+            for (const d of downloaded) d.cleanup();
+            if (again === 'queue') return queueRequest(req);
+            if (again === 'skipped') return { status: 'skipped', reason: 'busy' };
+            return { status: 'busy-elsewhere' };
+        }
+        const ok = await play(req, downloaded, null);
+        return ok ? { status: 'playing' } : { status: 'busy-elsewhere' };
     }
 
     // Called when the band or crew song ends in a channel and is about to leave. Returns true if queued
@@ -234,42 +309,47 @@ function createPlayback(deps) {
             return false;
         }
         clearPending();
-        run(p, connection).catch((err) => {
-            log('handoff failed: ' + (err && err.message));
-            stop({ leave: true });
-        });
+        fetchAll(p)
+            .then((downloaded) => play(p, downloaded, connection))
+            .catch((err) => {
+                log('handoff failed: ' + (err && err.message));
+                stop({ leave: true });
+            });
         return true;
     }
 
-    function ownsUrl(tag) {
-        return state.kind === 'url' && !!state.player && (!tag || state.tag === tag);
+    function ownsUrl(tag, channelId) {
+        return state.kind === 'url' && !!state.player && (!tag || state.tag === tag) && (!channelId || state.channelId === channelId);
     }
 
-    function pause({ tag = null, pauseMaxMs = null } = {}) {
-        if (!ownsUrl(tag)) return { ok: false, reason: 'nothing-playing' };
+    function pause({ tag = null, pauseMaxMs = null, channelId = null } = {}) {
+        if (!ownsUrl(tag, channelId)) return { ok: false, reason: 'nothing-playing' };
         if (state.paused) return { ok: true, paused: true };
         state.player.pause(true);
         state.paused = true;
         const ms = pauseMaxMs || state.pauseMaxMs || DEFAULT_PAUSE_MAX_MS;
-        pauseTimer = setTimer(() => {
+        const owner = state.player;
+        state.pauseTimer = setTimer(() => {
+            // Only the audio that was paused: a timer left over from earlier audio does nothing.
+            if (state.player !== owner || !state.paused) return;
             log('pause timed out, stopping');
             stop({ leave: true });
         }, ms);
         return { ok: true, paused: true };
     }
 
-    function resume({ tag = null } = {}) {
-        if (!ownsUrl(tag)) return { ok: false, reason: 'nothing-playing' };
+    function resume({ tag = null, channelId = null } = {}) {
+        if (!ownsUrl(tag, channelId)) return { ok: false, reason: 'nothing-playing' };
         if (!state.paused) return { ok: true, paused: false };
-        if (pauseTimer) clearTimer(pauseTimer);
-        pauseTimer = null;
+        if (state.pauseTimer) clearTimer(state.pauseTimer);
+        state.pauseTimer = null;
         state.paused = false;
         state.player.unpause();
         return { ok: true, paused: false };
     }
 
-    function skip({ tag = null } = {}) {
-        if (!ownsUrl(tag)) return { ok: false, reason: 'nothing-playing' };
+    function skip({ tag = null, channelId = null } = {}) {
+        if (!ownsUrl(tag, channelId)) return { ok: false, reason: 'nothing-playing' };
         if (state.paused) clearPause();
         // Stopping the player raises Idle, which advances to the next clip (or finishes after the last).
         state.player.stop(true);
@@ -289,13 +369,15 @@ function createPlayback(deps) {
         };
     }
 
-    return { start, handoff, pause, resume, skip, stop, status };
+    return { start, handoff, pause, resume, skip, stop, status, takeOver: (o) => takeOver(state, { clearTimer, ...o }) };
 }
 
 module.exports = {
     createPlayback,
     validatePlayUrl,
     decideBusy,
+    takeOver,
+    isBusy,
     parseAllowedHosts,
     hostAllowed,
     MAX_CLIPS,

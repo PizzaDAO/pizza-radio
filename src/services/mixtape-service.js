@@ -2,6 +2,7 @@ const { createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@
 const fs = require('fs');
 const path = require('path');
 const state = require('../state');
+const { takeOver } = require('./playback');
 
 const defaultMixtapeFolder = path.join(__dirname, '../../songs/mixtape');
 
@@ -38,6 +39,7 @@ async function startMixtape(connection, options = {}) {
 
     const allFilesCopy = [...allFiles];
     state.queue = shuffleArray([...allFiles]);
+    takeOver(state, { kind: null, channelId: connection.joinConfig && connection.joinConfig.channelId });
     state.connection = connection;
     state.player = createAudioPlayer();
 

@@ -12,5 +12,9 @@ module.exports = {
     paused: false,
     clipIndex: 0,
     clipCount: 0,
-    pending: null, // clips queued behind a band / crew song in the same channel
+    pending: null,
+    starting: false,
+    files: [],
+    pauseTimer: null,
+    pendingTimer: null, // clips queued behind a band / crew song in the same channel
 };

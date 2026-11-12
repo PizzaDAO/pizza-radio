@@ -231,3 +231,88 @@ test('stop with a channelId only acts on that channel', async () => {
     assert.strictEqual(h.pb.stop({ leave: true, channelId: 'A' }).stopped, true);
     assert.strictEqual(conn.destroyed, true);
 });
+
+test('pause then a new start: the old pause timer firing does not stop the new audio', async () => {
+    const h = harness();
+    await h.pb.start(req(2));
+    h.pb.pause({});
+    const oldTimer = h.timers[h.timers.length - 1];
+    await h.pb.start(req(2)); // replaces the paused audio
+    assert.strictEqual(oldTimer.cleared, true);
+    const conn = h.state.connection;
+    oldTimer.fn();
+    assert.strictEqual(conn.destroyed, false);
+    assert.notStrictEqual(h.state.player, null);
+    assert.strictEqual(h.pb.status().paused, false);
+});
+
+test('takeOver clears the pause timer and queued clips', async () => {
+    const h = harness();
+    await h.pb.start(req(2));
+    h.pb.pause({});
+    const t = h.timers[h.timers.length - 1];
+    h.pb.takeOver({ kind: 'band', channelId: 'A' });
+    assert.strictEqual(t.cleared, true);
+    assert.strictEqual(h.state.paused, false);
+    assert.strictEqual(h.state.kind, 'band');
+    assert.strictEqual(h.state.pending, null);
+});
+
+test('a destroyed or disconnected connection is not busy', () => {
+    for (const status of ['destroyed', 'disconnected']) {
+        assert.strictEqual(decideBusy({ player: null, connection: { state: { status }, joinConfig: { channelId: 'B' } } }, 'A', 'queue'), 'start');
+    }
+    assert.strictEqual(decideBusy({ player: null, connection: { state: { status: 'ready' }, joinConfig: { channelId: 'B' } } }, 'A', 'queue'), 'busy-elsewhere');
+});
+
+test('only band and crew are queued behind; an unknown kind in the same channel is busy', () => {
+    assert.strictEqual(decideBusy({ player: {}, connection: {}, kind: 'crew', channelId: 'A' }, 'A', 'queue'), 'queue');
+    assert.strictEqual(decideBusy({ player: {}, connection: {}, kind: null, channelId: 'A' }, 'A', 'queue'), 'busy-elsewhere');
+});
+
+test('a band that starts while clips download is not killed: the request queues behind it', async () => {
+    const h = harness();
+    const pb = createPlayback({
+        state: h.state, join: async () => h.mkConn(), createPlayer: () => new EventEmitter(), createResource: (f) => f,
+        download: async (u) => {
+            // the band takes over during the download
+            h.state.player = new EventEmitter();
+            h.state.connection = h.mkConn();
+            h.state.kind = 'band';
+            h.state.channelId = 'A';
+            return { path: u, cleanup() { h.log.push('cleanup ' + u); } };
+        },
+        setTimer: (fn, ms) => ({ fn, ms }), clearTimer() {}, now: () => 0, log() {},
+    });
+    const r = await pb.start(req(1));
+    assert.strictEqual(r.status, 'queued');
+    assert.strictEqual(h.state.kind, 'band');
+    assert.notStrictEqual(h.state.player, null);
+    assert.deepStrictEqual(h.log, ['cleanup c0']);
+});
+
+test('a second request while clips are being fetched is refused, not run in parallel', async () => {
+    const h = harness();
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const pb = createPlayback({
+        state: h.state, join: async () => h.mkConn(), createPlayer: () => Object.assign(new EventEmitter(), { play() {}, stop() {} }), createResource: (f) => f,
+        download: async (u) => { await gate; return { path: u, cleanup() {} }; },
+        setTimer: () => ({}), clearTimer() {}, now: () => 0, log() {},
+    });
+    const first = pb.start(req(1));
+    assert.deepStrictEqual(await pb.start(req(1)), { status: 'busy-elsewhere' });
+    release();
+    assert.strictEqual((await first).status, 'playing');
+});
+
+test('pause, resume and skip with a channelId only act on that channel', async () => {
+    const h = harness();
+    await h.pb.start(req(3));
+    assert.strictEqual(h.pb.pause({ channelId: 'B' }).ok, false);
+    assert.strictEqual(h.pb.skip({ channelId: 'B' }).ok, false);
+    assert.strictEqual(h.pb.pause({ channelId: 'A' }).ok, true);
+    assert.strictEqual(h.pb.resume({ channelId: 'B' }).ok, false);
+    assert.strictEqual(h.pb.resume({ channelId: 'A' }).ok, true);
+    assert.strictEqual(h.pb.skip({ channelId: 'A' }).ok, true);
+});

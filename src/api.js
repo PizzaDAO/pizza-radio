@@ -145,12 +145,13 @@ function createApiServer(client) {
                 return res.status(404).json({ error: `No audio files found for crew "${matchedCrew}"` });
             }
 
-            // Stop any existing playback
+            // Stop any existing playback (and any pause timer / queued clips of the spoken updates)
             if (state.player) {
                 state.player.removeAllListeners();
                 state.player.stop();
                 state.player = null;
             }
+            playback.takeOver({ kind: 'crew', channelId });
             state.queue = [];
 
             // Join voice channel
@@ -263,12 +264,13 @@ function createApiServer(client) {
                 return array;
             };
 
-            // Stop any existing playback
+            // Stop any existing playback (and any pause timer / queued clips of the spoken updates)
             if (state.player) {
                 state.player.removeAllListeners();
                 state.player.stop();
                 state.player = null;
             }
+            playback.takeOver({ kind: 'band', channelId });
             state.queue = shuffle([...allFiles]);
 
             const connection = joinVoiceChannel({
@@ -382,6 +384,7 @@ function createApiServer(client) {
 
     const controlOpts = (req) => ({
         tag: typeof (req.body || {}).tag === 'string' && req.body.tag ? req.body.tag : null,
+        channelId: typeof (req.body || {}).channelId === 'string' && req.body.channelId ? req.body.channelId : null,
         pauseMaxMs: Number((req.body || {}).pauseMaxMs) > 0 ? Number(req.body.pauseMaxMs) : null,
     });
     for (const action of ['pause', 'resume', 'skip']) {
