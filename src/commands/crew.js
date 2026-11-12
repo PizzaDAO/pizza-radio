@@ -52,7 +52,7 @@ module.exports = {
                 return;
             }
 
-            takeOver(state, { kind: 'crew', channelId: voiceChannel.id });
+            takeOver(state, { kind: null, channelId: voiceChannel.id });
             state.connection = joinVoiceChannel({
                 channelId: voiceChannel.id,
                 guildId: voiceChannel.guild.id,

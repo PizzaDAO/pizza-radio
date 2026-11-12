@@ -2,8 +2,8 @@ const { SlashCommandBuilder } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
-const state = require('../state');
-const { takeOver } = require('../services/playback'); // Import shared state
+const state = require('../state'); // Import shared state
+const { takeOver } = require('../services/playback');
 
 const targetFolder = path.join(__dirname, '../../songs/lobo');
 

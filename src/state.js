@@ -14,6 +14,7 @@ module.exports = {
     clipCount: 0,
     pending: null,
     starting: false,
+    generation: 0, // bumped whenever another command takes the player over
     files: [],
     pauseTimer: null,
     pendingTimer: null, // clips queued behind a band / crew song in the same channel

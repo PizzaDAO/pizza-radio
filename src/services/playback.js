@@ -78,6 +78,11 @@ function liveConnection(state) {
     return !DEAD_STATUSES.includes(status);
 }
 
+function connectionAlive(c) {
+    const status = c && c.state && c.state.status;
+    return !!c && !DEAD_STATUSES.includes(status);
+}
+
 function isBusy(state) {
     return !!(state.player || liveConnection(state) || state.starting);
 }
@@ -95,6 +100,7 @@ function takeOver(state, { kind = null, channelId = null, clearTimer = clearTime
             /* ignore */
         }
     }
+    state.generation = (state.generation || 0) + 1;
     state.pauseTimer = null;
     state.pendingTimer = null;
     state.files = [];
@@ -238,8 +244,13 @@ function createPlayback(deps) {
             if (state.player === player) stop({ leave: true });
             throw err;
         }
-        if (state.player !== player) {
-            // Something else took over while we were joining.
+        if (state.player !== player || !connectionAlive(connection)) {
+            // Something else took over while we were joining, or the connection died: never use it.
+            if (state.player === player) {
+                state.player = null;
+                state.kind = null;
+                state.channelId = null;
+            }
             for (const d of downloaded) d.cleanup();
             return false;
         }
@@ -309,11 +320,24 @@ function createPlayback(deps) {
             return false;
         }
         clearPending();
+        const gen = state.generation || 0;
+        state.starting = true;
         fetchAll(p)
-            .then((downloaded) => play(p, downloaded, connection))
+            .then(async (downloaded) => {
+                // Another command took over while the clips downloaded: leave it alone.
+                if ((state.generation || 0) !== gen) {
+                    for (const d of downloaded) d.cleanup();
+                    return;
+                }
+                state.starting = false;
+                await play(p, downloaded, connection);
+            })
             .catch((err) => {
                 log('handoff failed: ' + (err && err.message));
-                stop({ leave: true });
+                if ((state.generation || 0) === gen) {
+                    state.starting = false;
+                    stop({ leave: true });
+                }
             });
         return true;
     }

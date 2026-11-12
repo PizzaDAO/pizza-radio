@@ -61,7 +61,7 @@ test('decideBusy: idle starts, same channel queues, other channel is busy-elsewh
 });
 
 function harness() {
-    const state = { player: null, queue: [], connection: null, kind: null, channelId: null, tag: null, paused: false, clipIndex: 0, clipCount: 0, pending: null };
+    const state = { player: null, queue: [], connection: null, kind: null, channelId: null, tag: null, paused: false, clipIndex: 0, clipCount: 0, pending: null, generation: 0 };
     const timers = [];
     const log = [];
     let clock = 1000;
@@ -315,4 +315,48 @@ test('pause, resume and skip with a channelId only act on that channel', async (
     assert.strictEqual(h.pb.resume({ channelId: 'B' }).ok, false);
     assert.strictEqual(h.pb.resume({ channelId: 'A' }).ok, true);
     assert.strictEqual(h.pb.skip({ channelId: 'A' }).ok, true);
+});
+
+test('handoff is skipped when another command takes over while the clips download', async () => {
+    const h = harness();
+    const conn = h.mkConn();
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const pb = createPlayback({
+        state: h.state, join: async () => h.mkConn(), createPlayer: () => Object.assign(new EventEmitter(), { play() {}, stop() {} }), createResource: (f) => f,
+        download: async (u) => { await gate; return { path: u, cleanup() { h.log.push('cleanup ' + u); } }; },
+        setTimer: (fn, ms) => ({ fn, ms }), clearTimer() {}, now: () => 0, log() {},
+    });
+    h.state.player = new EventEmitter();
+    h.state.connection = conn;
+    h.state.kind = 'band';
+    h.state.channelId = 'A';
+    await pb.start(req(1));
+    h.state.player = null; // band finished
+    assert.strictEqual(pb.handoff(conn), true);
+    const gen = h.state.generation;
+    pb.takeOver({ kind: null, channelId: 'A' }); // a slash command grabs the player
+    assert.strictEqual(h.state.generation, gen + 1);
+    h.state.player = new EventEmitter();
+    release();
+    await new Promise((r) => setImmediate(r));
+    assert.deepStrictEqual(h.log, ['cleanup c0']);
+    assert.strictEqual(h.state.kind, null);
+    assert.notStrictEqual(h.state.player, null);
+});
+
+test('play never subscribes to a destroyed connection', async () => {
+    const h = harness();
+    let subscribed = false;
+    const dead = { state: { status: 'destroyed' }, subscribe() { subscribed = true; }, destroy() {}, joinConfig: { channelId: 'A' } };
+    const pb = createPlayback({
+        state: h.state, join: async () => dead, createPlayer: () => Object.assign(new EventEmitter(), { play() {}, stop() {} }), createResource: (f) => f,
+        download: async (u) => ({ path: u, cleanup() { h.log.push('cleanup ' + u); } }),
+        setTimer: () => ({}), clearTimer() {}, now: () => 0, log() {},
+    });
+    const r = await pb.start(req(1));
+    assert.strictEqual(r.status, 'busy-elsewhere');
+    assert.strictEqual(subscribed, false);
+    assert.strictEqual(h.state.player, null);
+    assert.deepStrictEqual(h.log, ['cleanup c0']);
 });
